@@ -103,6 +103,15 @@ from .sessions import (
     session_id,
     to_storage,
 )
+from .snapshots import (
+    SnapshotConflict,
+    SessionSnapshot,
+    SnapshotSession,
+    create_snapshot,
+    diff_snapshots,
+    list_snapshot_rows,
+    load_snapshot,
+)
 from .streams import (
     IntegrityConflict as StreamIntegrityConflict,
     UnknownStream,
@@ -195,6 +204,94 @@ class EventAccepted(BaseModel):
             "machine; null when no machine is enabled, the event predates "
             "enabling, or the device/machine projection has no log row"
         ),
+    )
+
+
+# ------------------------------------------------- session evolution snapshots
+
+
+class SnapshotCreateIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    snapshot_id: str = Field(
+        min_length=1,
+        max_length=256,
+        pattern=r"^[^/]+$",
+        description=(
+            "Client-chosen, globally unique id; re-POSTing it for the same "
+            "device replays the original snapshot, reusing it on another "
+            "device returns 409"
+        ),
+    )
+
+
+class SnapshotSessionRef(BaseModel):
+    session_id: str
+    started_at: datetime
+    ended_at: datetime
+    event_count: int
+
+
+class SessionSnapshotOut(BaseModel):
+    snapshot_id: str
+    device_id: str
+    event_high_water: int = Field(
+        description=(
+            "Frozen arrival high-water (events.seq): only events with "
+            "seq <= this value contributed to the snapshot"
+        )
+    )
+    gap_seconds: float = Field(
+        description="Session gap configuration frozen with this snapshot"
+    )
+    session_count: int
+    sessions: list[SessionOut] = Field(
+        description="Frozen sessions in snapshot-time (started_at) order"
+    )
+    created_at: datetime
+
+
+class SessionSnapshotSummaryOut(BaseModel):
+    snapshot_id: str
+    device_id: str
+    event_high_water: int
+    gap_seconds: float
+    session_count: int
+    sessions: list[SnapshotSessionRef] = Field(
+        description="Session ids and bounds, in snapshot-time order"
+    )
+    created_at: datetime
+
+
+class SnapshotDiffIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    old_snapshot_id: str = Field(min_length=1, max_length=256)
+    new_snapshot_id: str = Field(min_length=1, max_length=256)
+
+
+class SnapshotDiffEntryOut(BaseModel):
+    change: str = Field(
+        description=(
+            "unchanged | changed | merged | split | reorganized | created | "
+            "removed; reorganized marks a many-to-many connected component"
+        )
+    )
+    old_session_ids: list[str]
+    new_session_ids: list[str]
+    added_member_event_ids: list[str] = Field(
+        description="New-side members absent from the old side, sorted by (occurred_at, event_id)"
+    )
+    removed_member_event_ids: list[str] = Field(
+        description="Old-side members absent from the new side, sorted by (occurred_at, event_id)"
+    )
+
+
+class SnapshotDiffOut(BaseModel):
+    device_id: str
+    old_snapshot_id: str
+    new_snapshot_id: str
+    gap_seconds: float
+    changes: list[SnapshotDiffEntryOut] = Field(
+        description="One entry per bipartite-graph connected component, stably sorted"
     )
 
 
@@ -931,7 +1028,7 @@ def create_app(
         db_module.init_db(db_path)
         yield
 
-    app = FastAPI(title="Device Event Session Merger", version="1.10.0", lifespan=lifespan)
+    app = FastAPI(title="Device Event Session Merger", version="1.11.0", lifespan=lifespan)
     app.state.db_path = db_path
     app.state.gap_seconds = gap
     app.state.drift_ppm = drift_limit
@@ -1319,6 +1416,232 @@ def create_app(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"session {sid!r} not found for device {device_id!r}",
+        )
+
+    # -------------------------------------- session evolution snapshots
+
+    def frozen_session_out(
+        device_id: str, session: SnapshotSession
+    ) -> SessionOut:
+        return SessionOut(
+            session_id=session.session_id,
+            device_id=device_id,
+            started_at=session.started_at,
+            ended_at=session.ended_at,
+            event_count=session.event_count,
+            members=[
+                EventOut(
+                    device_id=device_id,
+                    event_id=member.event_id,
+                    occurred_at=member.occurred_at,
+                    event_type=member.event_type,
+                    schema_version=member.schema_version,
+                    payload=member.payload,
+                )
+                for member in session.members
+            ],
+        )
+
+    def snapshot_out_from_snapshot(
+        snapshot: SessionSnapshot,
+    ) -> SessionSnapshotOut:
+        return SessionSnapshotOut(
+            snapshot_id=snapshot.snapshot_id,
+            device_id=snapshot.device_id,
+            event_high_water=snapshot.event_high_water,
+            gap_seconds=snapshot.gap_seconds,
+            session_count=snapshot.session_count,
+            sessions=[
+                frozen_session_out(snapshot.device_id, session)
+                for session in snapshot.sessions
+            ],
+            created_at=snapshot.created_at,
+        )
+
+    def snapshot_summary_out_from_row(
+        conn: sqlite3.Connection, row: sqlite3.Row
+    ) -> SessionSnapshotSummaryOut:
+        session_rows = conn.execute(
+            "SELECT session_id, started_at, ended_at, members_json "
+            "FROM session_snapshot_sessions WHERE snapshot_id = ? "
+            "ORDER BY session_index",
+            (row["snapshot_id"],),
+        ).fetchall()
+        return SessionSnapshotSummaryOut(
+            snapshot_id=row["snapshot_id"],
+            device_id=row["device_id"],
+            event_high_water=row["event_high_water"],
+            gap_seconds=row["gap_seconds"],
+            session_count=row["session_count"],
+            sessions=[
+                SnapshotSessionRef(
+                    session_id=session_row["session_id"],
+                    started_at=from_storage(session_row["started_at"]),
+                    ended_at=from_storage(session_row["ended_at"]),
+                    event_count=len(
+                        json.loads(session_row["members_json"])["members"]
+                    ),
+                )
+                for session_row in session_rows
+            ],
+            created_at=from_storage(row["created_at"]),
+        )
+
+    @app.post(
+        "/devices/{device_id}/session-snapshots",
+        response_model=SessionSnapshotOut,
+        status_code=status.HTTP_201_CREATED,
+        responses={
+            200: {"description": "the snapshot_id already existed for this device (idempotent replay)"},
+            409: {"description": "snapshot_id is already bound to another device"},
+        },
+    )
+    def create_session_snapshot(
+        device_id: str,
+        body: SnapshotCreateIn,
+        response: Response,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> SessionSnapshotOut:
+        """Freeze the device's current sessions as one immutable snapshot.
+
+        Inside one ``BEGIN IMMEDIATE`` write transaction the endpoint first
+        pins the device's current monotonic arrival high-water
+        (``events.seq``) and then derives the sessions strictly from the
+        events with ``seq <=`` that mark using the server's configured
+        ``SESSION_GAP_SECONDS``. Sessions and their ordered members are
+        copied into dedicated snapshot tables, so later late events and
+        retention cleanup never rewrite the snapshot.
+
+        A repeated POST with the same ``snapshot_id`` for the same device
+        is an idempotent replay (``200``) of the originally stored
+        snapshot -- same high-water, sessions and ``created_at`` -- even
+        when the live sessions have since evolved. Reusing a
+        ``snapshot_id`` on a different device returns ``409`` and stores
+        nothing.
+        """
+        created_at = datetime.now(timezone.utc)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            snapshot, created = create_snapshot(
+                conn,
+                snapshot_id=body.snapshot_id,
+                device_id=device_id,
+                gap_seconds=app.state.gap_seconds,
+                created_at=created_at,
+            )
+            conn.commit()
+        except SnapshotConflict as exc:
+            conn.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail=exc.detail
+            ) from exc
+        except Exception:
+            conn.rollback()
+            raise
+        if not created:
+            response.status_code = status.HTTP_200_OK
+        return snapshot_out_from_snapshot(snapshot)
+
+    @app.get(
+        "/devices/{device_id}/session-snapshots",
+        response_model=list[SessionSnapshotSummaryOut],
+    )
+    def list_session_snapshots(
+        device_id: str,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> list[SessionSnapshotSummaryOut]:
+        """List the device's snapshots oldest first."""
+        rows = list_snapshot_rows(conn, device_id)
+        return [snapshot_summary_out_from_row(conn, row) for row in rows]
+
+    @app.get(
+        "/devices/{device_id}/session-snapshots/{snapshot_id}",
+        response_model=SessionSnapshotOut,
+        responses={404: {"description": "unknown snapshot for the device"}},
+    )
+    def get_session_snapshot(
+        device_id: str,
+        snapshot_id: CommandId,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> SessionSnapshotOut:
+        """Fetch one full frozen snapshot (sessions with their members)."""
+        snapshot = load_snapshot(conn, snapshot_id)
+        if snapshot is None or snapshot.device_id != device_id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=(
+                    f"snapshot {snapshot_id!r} is not known for device "
+                    f"{device_id!r}"
+                ),
+            )
+        return snapshot_out_from_snapshot(snapshot)
+
+    @app.post(
+        "/devices/{device_id}/session-snapshots/diff",
+        response_model=SnapshotDiffOut,
+        responses={
+            404: {"description": "one of the snapshot ids is unknown for the device"},
+            409: {"description": "the snapshots were frozen with different gap configurations"},
+        },
+    )
+    def diff_session_snapshots(
+        device_id: str,
+        body: SnapshotDiffIn,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> SnapshotDiffOut:
+        """Compare two frozen snapshots of the device, old -> new.
+
+        The bipartite graph links an old session to a new session when
+        they share an ``event_id``; each connected component is reported
+        once as ``unchanged`` (1:1, same members), ``changed`` (1:1,
+        different members), ``merged`` (n old -> 1 new), ``split``
+        (1 old -> n new), ``reorganized`` (many-to-many), ``created``
+        (new side only) or ``removed`` (old side only). Entries carry
+        both sides' session ids and the members added/removed, all sorted
+        stably. The comparison reads only the frozen copies, so late
+        arrivals and cleanup cannot change the result; snapshots frozen
+        with different ``gap_seconds`` are rejected with ``409``.
+        """
+        old_snapshot = load_snapshot(conn, body.old_snapshot_id)
+        if old_snapshot is None or old_snapshot.device_id != device_id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=(
+                    f"snapshot {body.old_snapshot_id!r} is not known for "
+                    f"device {device_id!r}"
+                ),
+            )
+        new_snapshot = load_snapshot(conn, body.new_snapshot_id)
+        if new_snapshot is None or new_snapshot.device_id != device_id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=(
+                    f"snapshot {body.new_snapshot_id!r} is not known for "
+                    f"device {device_id!r}"
+                ),
+            )
+        if old_snapshot.gap_seconds != new_snapshot.gap_seconds:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "message": (
+                        "snapshots were frozen with different gap "
+                        "configurations and cannot be compared"
+                    ),
+                    "reason": "gap_configuration_mismatch",
+                    "old_snapshot_id": old_snapshot.snapshot_id,
+                    "old_gap_seconds": old_snapshot.gap_seconds,
+                    "new_snapshot_id": new_snapshot.snapshot_id,
+                    "new_gap_seconds": new_snapshot.gap_seconds,
+                },
+            )
+        changes = diff_snapshots(old_snapshot, new_snapshot)
+        return SnapshotDiffOut(
+            device_id=device_id,
+            old_snapshot_id=old_snapshot.snapshot_id,
+            new_snapshot_id=new_snapshot.snapshot_id,
+            gap_seconds=old_snapshot.gap_seconds,
+            changes=changes,
         )
 
     # ------------------------------------------------ collection integrity

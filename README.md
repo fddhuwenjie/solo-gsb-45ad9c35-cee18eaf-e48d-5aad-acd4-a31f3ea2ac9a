@@ -12,6 +12,8 @@
 
 服务还内置**设备时钟校准**：设备上报 `(anchor_id, observed_seq, device_time, reference_time)` 锚点，`anchor_id` 内容一致时幂等、`observed_seq` 必须递增，`device_time` 不前进（回退或相等）即开启新 epoch；同一 epoch 内用相邻锚点线性插值把设备时间归一化到参考时间，漂移超过 `CLOCK_DRIFT_PPM` 或 `reference_time` 不递增的锚点返回 `409` 且不落库，锚点支持区间外仅在配置的外推范围内线性外推。单事件归一化接口返回 `corrected_at`、epoch、计算方式与不确定区间；跨设备时间线按 `corrected_at` 排序，并在首个游标中冻结各设备锚点高水位，使翻页过程中新写入的锚点不会造成重复或漏项（见[设备时钟校准](#设备时钟校准)）。
 
+服务还提供**会话演变快照**：`POST /devices/{device_id}/session-snapshots` 在同一写事务内冻结设备当前的事件单调序列高水位（`events.seq`）并按现有 gap 配置把当时的会话与**有序成员完整复制**入库；`snapshot_id` 全局唯一，同设备重复提交幂等返回原快照，跨设备复用返回 `409`。两快照差异接口以共享 `event_id` 构建旧/新会话二部图，按连通分量判定 `unchanged`、`changed`、`merged`、`split`、`created`、`removed`，多对多分量标为 `reorganized`，输出双方会话 ID、增删成员并稳定排序；gap 配置不同的快照拒绝比较。迟到事件与保留清理都不会改写旧快照（见[会话演变快照](#会话演变快照)）。
+
 ## 启动
 
 ```bash
@@ -175,7 +177,122 @@ curl -s http://localhost:8000/devices/dev-1/sessions/<session_id>
 
 不存在时返回 `404`。
 
-## 持久化下行命令队列
+## 会话演变快照
+
+会话是读取时从全量有序事件实时归并的：迟到事件可能桥接两个会话，保留清理可能删除事件。**会话演变快照**把某一时刻设备的会话连同有序成员一起**冻结**，并支持对比任意两个快照，得到会话的产生、消失、合并、拆分与重组。
+
+### 创建快照 `POST /devices/{device_id}/session-snapshots`
+
+请求体 `{"snapshot_id": "<客户端选择的 id>"}`，`snapshot_id` 非空、不含 `/`、最长 256，且**全局唯一**。创建在**单个写事务（`BEGIN IMMEDIATE`）**内完成：先冻结设备当前的事件单调序列高水位（持久、不复用的 `events.seq`），再严格从 `seq <= 高水位` 的事件按现有 `SESSION_GAP_SECONDS` 配置归并出会话，最后把每个会话及其按 `(occurred_at, event_id)` 排序的成员**完整复制**到快照表（含 `event_type` / `schema_version` / `payload`）。
+
+- `201 Created`：冻结成功。响应含 `event_high_water`、`gap_seconds`、`session_count`、`sessions`（结构与会话查询接口一致：`session_id`、`started_at`、`ended_at`、`event_count`、`members`）与 `created_at`。
+- `200 OK`：同一设备、同一 `snapshot_id` 的重复提交——**幂等返回首次的原快照**（相同高水位、会话、成员与 `created_at`），即使此后迟到事件已让实时会话演变、或部分事件已被清理，也不重新冻结。
+- `409 Conflict`：该 `snapshot_id` 已属于**另一台设备**（`reason: "snapshot_id_device_conflict"`，响应给出 `bound_device_id`）；快照 id 不能跨设备复用，本次不写入任何内容。
+
+```bash
+BASE=http://localhost:8000
+
+# 两个相隔 480s（> 默认 gap 300s）的事件 -> 两个会话
+curl -s -X POST $BASE/events -H 'Content-Type: application/json' \
+  -d '{"device_id":"d","event_id":"a","occurred_at":"2026-09-20T10:00:00Z"}'
+curl -s -X POST $BASE/events -H 'Content-Type: application/json' \
+  -d '{"device_id":"d","event_id":"b","occurred_at":"2026-09-20T10:08:00Z"}'
+
+curl -s -X POST $BASE/devices/d/session-snapshots \
+  -H 'Content-Type: application/json' -d '{"snapshot_id":"snap-before"}'
+# 201 {
+#   "snapshot_id":"snap-before","device_id":"d","event_high_water":2,
+#   "gap_seconds":300.0,"session_count":2,
+#   "sessions":[{"session_id":"…","event_count":1,"members":[{"event_id":"a", ...}]},
+#               {"session_id":"…","event_count":1,"members":[{"event_id":"b", ...}]}],
+#   "created_at":"…"
+# }
+
+# 同一 id 重复提交 -> 200，返回原快照
+curl -s -o /dev/null -w '%{http_code}\n' -X POST $BASE/devices/d/session-snapshots \
+  -H 'Content-Type: application/json' -d '{"snapshot_id":"snap-before"}'   # => 200
+
+# 跨设备复用同一 id -> 409
+curl -s -X POST $BASE/devices/other/session-snapshots \
+  -H 'Content-Type: application/json' -d '{"snapshot_id":"snap-before"}'
+# 409 {"detail":{"reason":"snapshot_id_device_conflict",
+#               "bound_device_id":"d","conflicting_device_id":"other", ...}}
+```
+
+### 查询快照
+
+- `GET /devices/{device_id}/session-snapshots`：按创建时间升序列出该设备的快照摘要（`snapshot_id`、`event_high_water`、`gap_seconds`、`session_count`、各会话的 `session_id` / `started_at` / `ended_at` / `event_count` 与 `created_at`）。
+- `GET /devices/{device_id}/session-snapshots/{snapshot_id}`：取单个快照的完整内容（含全部冻结成员）。快照不存在、或该 id 属于其它设备时返回 `404`。
+
+### 两快照差异 `POST /devices/{device_id}/session-snapshots/diff`
+
+请求体：
+
+```json
+{"old_snapshot_id": "snap-before", "new_snapshot_id": "snap-after"}
+```
+
+对比**同一设备**的两个冻结快照（方向为 old → new）。算法以**共享 `event_id`** 构建旧会话（左）与新会话（右）的二部图：一个旧会话与一个新会话只要共享至少一个成员就连边；每个连通分量按下表分类：
+
+| `change` | 判定 |
+|---|---|
+| `unchanged` | 1 个旧会话 ↔ 1 个新会话，成员集合完全相同 |
+| `changed` | 1 个旧会话 ↔ 1 个新会话，成员集合不同（有增/删成员但未拆分合并） |
+| `merged` | 多个旧会话 → 1 个新会话（如迟到事件桥接） |
+| `split` | 1 个旧会话 → 多个新会话（如中间事件被清理后链条断开） |
+| `reorganized` | 多个旧会话 ↔ 多个新会话的多对多连通分量 |
+| `created` | 分量只含新会话（其成员在旧快照中不存在） |
+| `removed` | 分量只含旧会话（其成员在新快照中不存在） |
+
+每个分量输出：
+
+- `old_session_ids` / `new_session_ids`：双方会话 ID（不存在的一侧为 `[]`）；
+- `added_member_event_ids`：新侧有、旧侧无的成员 ID，按 `(occurred_at, event_id)` 稳定排序；
+- `removed_member_event_ids`：旧侧有、新侧无的成员 ID，同样稳定排序。
+
+各分量按起始时间稳定排序。**对比只读取冻结副本，不读实时事件表**，因此迟到事件与清理都不会改变既有快照之间的对比结果。
+
+- `200 OK`：返回 `device_id`、两个快照 id、`gap_seconds` 与 `changes` 数组。
+- `404 Not Found`：任一快照不存在或不属于路径中的设备（含两 id 分属不同设备的情况）。
+- `409 Conflict`：两个快照冻结时使用的 gap 配置不同（`reason: "gap_configuration_mismatch"`，响应给出两侧 `gap_seconds`）；会话边界依赖 gap，配置不同不可比较。
+
+```bash
+# 迟到事件 c 落在中间（两侧各 240s <= 300s）-> 两个旧会话合并为一个
+curl -s -X POST $BASE/events -H 'Content-Type: application/json' \
+  -d '{"device_id":"d","event_id":"c","occurred_at":"2026-09-20T10:04:00Z"}'
+# 再晚些来一个独立事件 d -> 另一个新会话
+curl -s -X POST $BASE/events -H 'Content-Type: application/json' \
+  -d '{"device_id":"d","event_id":"d","occurred_at":"2026-09-20T11:00:00Z"}'
+
+curl -s -X POST $BASE/devices/d/session-snapshots \
+  -H 'Content-Type: application/json' -d '{"snapshot_id":"snap-after"}'
+
+curl -s -X POST $BASE/devices/d/session-snapshots/diff \
+  -H 'Content-Type: application/json' \
+  -d '{"old_snapshot_id":"snap-before","new_snapshot_id":"snap-after"}'
+# {
+#   "device_id":"d","old_snapshot_id":"snap-before",
+#   "new_snapshot_id":"snap-after","gap_seconds":300.0,
+#   "changes":[
+#     {"change":"merged",
+#      "old_session_ids":["<hash(a)>","<hash(b)>"],
+#      "new_session_ids":["<hash(a,c,b)>"],
+#      "added_member_event_ids":["c"],"removed_member_event_ids":[]},
+#     {"change":"created","old_session_ids":[],
+#      "new_session_ids":["<hash(d)>"],
+#      "added_member_event_ids":["d"],"removed_member_event_ids":[]}
+#   ]
+# }
+```
+
+### 不可变性、与清理的关系、存储与迁移
+
+- **迟到事件不改写旧快照**：事件按其插入时拿到的单调 `seq` 与快照冻结的高水位比较；高水位之后到达的事件（即使事件时间落在旧区间）只影响实时会话与之后创建的新快照，旧快照的会话、成员、`session_id` 与高水位均原样保留。
+- **清理不改写旧快照**：快照成员是**完整复制**（不是按 `event_id` 引用 `events` 行），且快照表对 `events` **不建外键**。[可确认的保留清理](#可确认的保留清理)删除事件后，旧快照照常可读取、其差异结果照常可复算；被删事件在差异中表现为 `removed` / `split`。
+- 快照头部与会话分别持久化在 SQLite 的 `session_snapshots`（`snapshot_id` 全局主键、`device_id`、冻结的 `event_high_water` 与 `gap_seconds`、`session_count`、`created_at`）与 `session_snapshot_sessions`（`snapshot_id` + 有序 `session_index`、`session_id`、起止时间、规范化 JSON 的有序成员副本）表。
+- 升级到本版本时服务启动以 `CREATE TABLE IF NOT EXISTS` **自动、幂等**建表（旧库无需手工脚本，Docker Compose 启动方式、端口与既有接口完全不变）；新接口与同一套 WAL + `BEGIN IMMEDIATE` + `busy_timeout` 并发模型一致：高水位读取、事件窗口读取与快照行插入在同一把单写者锁下完成，并发创建不会把彼此的事件冻结进高水位。
+
+
 
 每台设备拥有一个**严格按创建序列（FIFO）交付**的持久化下行命令队列：提交时携带 `command_id` 与**任意 JSON payload**；设备端通过 `claim` 领取**队首**并获得一个不可预测、带有效期的 `lease_token`，用它完成 `ack`（成功）或 `nack`（失败重试）。队列状态全部持久化在 SQLite 的 `device_commands` 表，服务重启后租约、退避与 attempt 计数都原样保留。
 
@@ -1005,7 +1122,7 @@ curl -s localhost:8000/devices/d/sessions        # => 1 个会话，成员 [a, c
 
 ## 持久化与并发模型
 
-契约（文档、`supersedes`、注册时间）与事件的 `event_type` / `schema_version` / `payload` 均保存在 SQLite（`schemas` 表与扩展后的 `events` 表）。保留清理计划保存在 `cleanup_plans` 表（条件、候选快照、摘要、状态、确认时间）。下行命令队列保存在 `device_commands` 表（`seq`、命令标识与规范化 payload、租约/退避时间戳、`attempts` 与终态）。版本化告警规则、告警实例、命中进度与规则版本的事件时间时代边界保存在 `alarm_rules` / `alarms` / `alarm_rule_progress` 表。设备状态机的不可变版本定义、启用状态/当前状态/到达高水位与追加式转移日志保存在 `state_machine_versions` / `device_state_machines` / `state_transitions_log` 表。设备时钟校准锚点保存在 `clock_anchors` 表（观测序号、设备/参考时间、epoch、实测漂移与持久 `seq`）。采集流、序号账本与检查点保存在 `collection_streams` / `collection_stream_events` / `collection_stream_checkpoints` 表。服务启动时自动幂等建表、为旧版数据库补齐新列、按需建出队列表，历史数据无需迁移脚本。`events` 上维护 `(device_id, occurred_at, event_id)` 与 `(occurred_at, event_id)` 两个索引，后者供 `POST /events/search` 的跨设备键集扫描使用；`device_commands` 上维护 `(device_id, seq)` 索引以支持严格 FIFO 取队首；`alarms` 上维护 `(device_id, fired_at)` 索引以支持告警列表；`state_transitions_log` 上维护 `(device_id, id)` 索引以支持按到达序的游标分页；`clock_anchors` 上维护 `(device_id, observed_seq)` 与 `(device_id, seq)` 两个索引，分别支撑锚点链校验与时间线首屏的逐设备锚点高水位冻结。
+契约（文档、`supersedes`、注册时间）与事件的 `event_type` / `schema_version` / `payload` 均保存在 SQLite（`schemas` 表与扩展后的 `events` 表）。保留清理计划保存在 `cleanup_plans` 表（条件、候选快照、摘要、状态、确认时间）。下行命令队列保存在 `device_commands` 表（`seq`、命令标识与规范化 payload、租约/退避时间戳、`attempts` 与终态）。版本化告警规则、告警实例、命中进度与规则版本的事件时间时代边界保存在 `alarm_rules` / `alarms` / `alarm_rule_progress` 表。设备状态机的不可变版本定义、启用状态/当前状态/到达高水位与追加式转移日志保存在 `state_machine_versions` / `device_state_machines` / `state_transitions_log` 表。设备时钟校准锚点保存在 `clock_anchors` 表（观测序号、设备/参考时间、epoch、实测漂移与持久 `seq`）。采集流、序号账本与检查点保存在 `collection_streams` / `collection_stream_events` / `collection_stream_checkpoints` 表。会话演变快照保存在 `session_snapshots` / `session_snapshot_sessions` 表（冻结的高水位、gap 配置与会话成员的完整 JSON 副本，不引用 `events` 行）。服务启动时自动幂等建表、为旧版数据库补齐新列、按需建出队列表，历史数据无需迁移脚本。`events` 上维护 `(device_id, occurred_at, event_id)` 与 `(occurred_at, event_id)` 两个索引，后者供 `POST /events/search` 的跨设备键集扫描使用；`device_commands` 上维护 `(device_id, seq)` 索引以支持严格 FIFO 取队首；`alarms` 上维护 `(device_id, fired_at)` 索引以支持告警列表；`state_transitions_log` 上维护 `(device_id, id)` 索引以支持按到达序的游标分页；`clock_anchors` 上维护 `(device_id, observed_seq)` 与 `(device_id, seq)` 两个索引，分别支撑锚点链校验与时间线首屏的逐设备锚点高水位冻结。
 
 ### 自动迁移与单调序列 `seq`
 

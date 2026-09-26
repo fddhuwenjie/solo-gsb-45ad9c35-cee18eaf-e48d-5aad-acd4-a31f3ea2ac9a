@@ -284,6 +284,45 @@ CREATE TABLE IF NOT EXISTS collection_stream_checkpoints (
     FOREIGN KEY (device_id, stream_id)
         REFERENCES collection_streams (device_id, stream_id)
 );
+-- Session evolution snapshots. A snapshot freezes one device's sessions at
+-- one arrival high-water: ``event_high_water`` is the monotonic
+-- ``events.seq`` mark captured inside the creating write transaction, and
+-- the sessions are derived only from rows with seq <= that mark. Each
+-- snapshot additionally pins the ``gap_seconds`` configuration used to
+-- build it: two snapshots built with different gaps are never compared.
+-- ``snapshot_id`` is client-chosen and GLOBALLY unique (cross-device reuse
+-- is a 409, same-device re-POST replays the original snapshot), so it is
+-- the primary key without device_id.
+CREATE TABLE IF NOT EXISTS session_snapshots (
+    snapshot_id       TEXT PRIMARY KEY,
+    device_id         TEXT NOT NULL,
+    event_high_water  INTEGER NOT NULL CHECK (event_high_water >= 0),
+    gap_seconds       REAL NOT NULL CHECK (gap_seconds >= 0),
+    session_count     INTEGER NOT NULL CHECK (session_count >= 0),
+    created_at        TEXT NOT NULL  -- UTC ISO-8601
+);
+-- Per-device, chronologically ordered snapshot listing.
+CREATE INDEX IF NOT EXISTS idx_session_snapshots_device
+    ON session_snapshots (device_id, created_at, snapshot_id);
+-- The frozen, ordered sessions of one snapshot. Members are COPIED in full
+-- (canonical JSON: the session_id plus every member's event_id,
+-- occurred_at, event_type, schema_version and payload), so a late event or
+-- a retention cleanup can never rewrite an old snapshot and snapshots stay
+-- readable after the referenced event rows have been deleted. The table
+-- deliberately has no REFERENCES events(event_id). ``session_index`` keeps
+-- the snapshot-time (started_at, event_id) session order stable.
+CREATE TABLE IF NOT EXISTS session_snapshot_sessions (
+    snapshot_id   TEXT NOT NULL,
+    session_index INTEGER NOT NULL CHECK (session_index >= 0),
+    session_id    TEXT NOT NULL,
+    started_at    TEXT NOT NULL,  -- UTC ISO-8601
+    ended_at      TEXT NOT NULL,
+    members_json  TEXT NOT NULL,  -- canonical JSON copy of the ordered members
+    PRIMARY KEY (snapshot_id, session_index),
+    FOREIGN KEY (snapshot_id) REFERENCES session_snapshots (snapshot_id)
+);
+CREATE INDEX IF NOT EXISTS idx_session_snapshot_sessions_id
+    ON session_snapshot_sessions (snapshot_id, session_id);
 """
 
 # Columns added after the initial release; applied idempotently to existing DBs.
