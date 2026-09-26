@@ -272,3 +272,56 @@ def test_snapshot_on_migrated_data_survives_delete_max_then_insert(tmp_path):
             ).fetchone() == (5,)
         finally:
             conn.close()
+
+
+def test_legacy_db_gains_session_snapshot_tables(tmp_path):
+    """Pre-snapshot databases open with the snapshot tables created."""
+    db_path = tmp_path / "legacy.db"
+    rows = [
+        ("e1", "dev-1", "2026-09-20T10:00:00+00:00"),
+        ("e2", "dev-1", "2026-09-20T10:01:00+00:00"),
+    ]
+    _create_legacy_db(str(db_path), LEGACY_SCHEMA, rows)
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert "session_snapshots" not in tables
+    finally:
+        conn.close()
+
+    app = create_app(database_path=str(db_path), gap_seconds=300)
+    with TestClient(app) as client:
+        resp = client.post(
+            "/devices/dev-1/session-snapshots",
+            json={"snapshot_id": "snap-1"},
+        )
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        assert body["high_water_seq"] == 2
+        assert body["session_count"] == 1
+        assert [m["event_id"] for m in body["sessions"][0]["members"]] == [
+            "e1",
+            "e2",
+        ]
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert {
+            "session_snapshots",
+            "session_snapshot_sessions",
+            "session_snapshot_members",
+        } <= tables
+    finally:
+        conn.close()

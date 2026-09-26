@@ -284,6 +284,53 @@ CREATE TABLE IF NOT EXISTS collection_stream_checkpoints (
     FOREIGN KEY (device_id, stream_id)
         REFERENCES collection_streams (device_id, stream_id)
 );
+-- Session evolution snapshots. A snapshot freezes one device's session
+-- projection at a point in time. ``snapshot_id`` is client-chosen and
+-- globally unique: reusing one for the same device replays the stored
+-- snapshot, while reusing it on another device violates the PRIMARY KEY
+-- and is rejected with 409. ``high_water_seq`` pins the device's event
+-- monotonic sequence (MAX(events.seq) captured in the snapshot write
+-- transaction) and ``gap_seconds`` records the grouping configuration:
+-- snapshots grouped under different gaps are never compared.
+CREATE TABLE IF NOT EXISTS session_snapshots (
+    snapshot_id    TEXT PRIMARY KEY,
+    device_id      TEXT NOT NULL,
+    high_water_seq INTEGER NOT NULL CHECK (high_water_seq >= 0),
+    gap_seconds    REAL NOT NULL,
+    session_count  INTEGER NOT NULL CHECK (session_count >= 0),
+    created_at     TEXT NOT NULL  -- UTC ISO-8601
+);
+CREATE INDEX IF NOT EXISTS idx_session_snapshots_device
+    ON session_snapshots (device_id, created_at, snapshot_id);
+-- The ordered sessions of a snapshot. Rows deliberately carry NO
+-- REFERENCES to events: the frozen members in
+-- session_snapshot_members are independent copies, so a retention
+-- cleanup deleting events can never damage or rewrite a snapshot.
+CREATE TABLE IF NOT EXISTS session_snapshot_sessions (
+    snapshot_id  TEXT NOT NULL,
+    session_index INTEGER NOT NULL CHECK (session_index >= 0),
+    session_id   TEXT NOT NULL,  -- deterministic id over the frozen members
+    started_at   TEXT NOT NULL,
+    ended_at     TEXT NOT NULL,
+    event_count  INTEGER NOT NULL CHECK (event_count >= 0),
+    member_ids   TEXT NOT NULL,  -- JSON array of event_ids in session order
+    PRIMARY KEY (snapshot_id, session_index)
+);
+-- Frozen event copies of a snapshot, one row per member. Each event is in
+-- exactly one session of a snapshot (sessions partition the frozen set),
+-- hence PRIMARY KEY (snapshot_id, event_id). The payload text is the same
+-- canonicalized JSON the events table stores.
+CREATE TABLE IF NOT EXISTS session_snapshot_members (
+    snapshot_id    TEXT NOT NULL,
+    event_id       TEXT NOT NULL,
+    occurred_at    TEXT NOT NULL,  -- UTC ISO-8601, lexicographically sortable
+    event_type     TEXT,
+    schema_version TEXT,
+    payload        TEXT,
+    PRIMARY KEY (snapshot_id, event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_session_snapshot_members_time
+    ON session_snapshot_members (snapshot_id, occurred_at, event_id);
 """
 
 # Columns added after the initial release; applied idempotently to existing DBs.
